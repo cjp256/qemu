@@ -115,6 +115,7 @@ typedef struct VFIOPCIDevice {
     int interrupt; /* Current interrupt type */
     VFIOBAR bars[PCI_NUM_REGIONS - 1]; /* No ROM */
     VFIOVGA *vga; /* 0xa0000, 0x3b0, 0x3c0 */
+    void *igd_opregion;
     PCIHostDeviceAddress host;
     EventNotifier err_notifier;
     EventNotifier req_notifier;
@@ -156,5 +157,12 @@ void vfio_bar_quirk_setup(VFIOPCIDevice *vdev, int nr);
 void vfio_bar_quirk_exit(VFIOPCIDevice *vdev, int nr);
 void vfio_bar_quirk_finalize(VFIOPCIDevice *vdev, int nr);
 void vfio_setup_resetfn_quirk(VFIOPCIDevice *vdev);
+
+int vfio_pci_igd_opregion_init(VFIOPCIDevice *vdev,
+                               struct vfio_region_info *region);
+int vfio_pci_igd_host_init(VFIOPCIDevice *vdev,
+                           struct vfio_region_info *region);
+int vfio_pci_igd_lpc_init(VFIOPCIDevice *vdev,
+                           struct vfio_region_info *region);
 
 #endif /* HW_VFIO_VFIO_PCI_H */

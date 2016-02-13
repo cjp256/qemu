@@ -11,9 +11,11 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/nvram/fw_cfg.h"
 #include "pci.h"
 #include "trace.h"
 #include "qemu/range.h"
+#include "qemu/error-report.h"
 
 /* Use uin32_t for vendor & device so PCI_ANY_ID expands and cannot match hw */
 static bool vfio_pci_is(VFIOPCIDevice *vdev, uint32_t vendor, uint32_t device)
@@ -1202,4 +1204,178 @@ void vfio_setup_resetfn_quirk(VFIOPCIDevice *vdev)
         }
         break;
     }
+}
+
+/*
+ * Intel IGD support
+ *
+ * We need to do a few things to support Intel Integrated Graphics Devices:
+ *  1) Expose the OpRegion if one is provided to us
+ *  2) Copy key PCI config space register values from the host bridge
+ *  3) Create an LPC/ISA bridge and do the same for it.
+ *
+ * Each of these is supported in vfio-pci through the use of device specific
+ * regions.  The main vfio-pci driver calls out to the init functions here
+ * for each of those found regions.  All three of these operations are
+ * necessary for SandyBridge, IvyBridge, ValleyView, and Haswell graphics.
+ * For newer versions of IGD, such as Broadwell and SkyLake, Intel supports
+ * an assignment mode without requiring 2) and 3).  Since we don't know what
+ * driver will be used in the guest, we don't do any filtering here but that
+ * may change at some point.
+ */
+int vfio_pci_igd_opregion_init(VFIOPCIDevice *vdev,
+                               struct vfio_region_info *region)
+{
+    DeviceClass *dc = DEVICE_GET_CLASS(vdev);
+    int ret;
+
+    if (vdev->pdev.qdev.hotplugged) {
+        return -EINVAL;
+    }
+
+    dc->hotpluggable = false;
+
+    vdev->igd_opregion = g_malloc0(region->size);
+    ret = pread(vdev->vbasedev.fd, vdev->igd_opregion,
+                region->size, region->offset);
+    if (ret != region->size) {
+        error_report("vfio: Error reading IGD OpRegion\n");
+        g_free(vdev->igd_opregion);
+        vdev->igd_opregion = NULL;
+        return -EINVAL;
+    }
+
+    fw_cfg_add_file(fw_cfg_find(), "etc/igd-opregion",
+                    vdev->igd_opregion, region->size);
+
+    trace_vfio_pci_igd_opregion_enabled(vdev->vbasedev.name);
+
+    return 0;
+}
+
+/* Define config register sets to copy from the host devices */
+typedef struct {
+    uint8_t offset;
+    uint8_t len;
+} IGDHostInfo;
+
+static const IGDHostInfo igd_host_bridge_infos[] = {
+    {PCI_REVISION_ID,         2},
+    {PCI_SUBSYSTEM_VENDOR_ID, 2},
+    {PCI_SUBSYSTEM_ID,        2},
+};
+
+static const IGDHostInfo igd_lpc_bridge_infos[] = {
+    {PCI_VENDOR_ID,           2},
+    {PCI_DEVICE_ID,           2},
+    {PCI_REVISION_ID,         2},
+    {PCI_SUBSYSTEM_VENDOR_ID, 2},
+    {PCI_SUBSYSTEM_ID,        2},
+};
+
+static int vfio_pci_igd_copy(VFIOPCIDevice *vdev, PCIDevice *pdev,
+                             struct vfio_region_info *region,
+                             const IGDHostInfo *list, int len)
+{
+    int i, ret;
+
+    for (i = 0; i < len; i++) {
+        ret = pread(vdev->vbasedev.fd, pdev->config + list[i].offset,
+                    list[i].len, region->offset + list[i].offset);
+        if (ret != list[i].len) {
+            error_report("IGD copy failed: %m\n");
+            return -errno;
+        }
+    }
+
+    return 0;
+}
+
+int vfio_pci_igd_host_init(VFIOPCIDevice *vdev,
+                           struct vfio_region_info *region)
+{
+    DeviceClass *dc = DEVICE_GET_CLASS(vdev);
+    PCIBus *bus;
+    PCIDevice *host_bridge;
+    int ret;
+
+    if (vdev->pdev.qdev.hotplugged) {
+        return -EINVAL;
+    }
+
+    dc->hotpluggable = false;
+
+    bus = pci_device_root_bus(&vdev->pdev);
+    host_bridge = pci_find_device(bus, 0, PCI_DEVFN(0, 0));
+
+    if (!host_bridge) {
+        error_report("Can't find host bridge");
+        return -ENODEV;
+    }
+
+    ret = vfio_pci_igd_copy(vdev, host_bridge, region, igd_host_bridge_infos,
+                            ARRAY_SIZE(igd_host_bridge_infos));
+    if (!ret) {
+        trace_vfio_pci_igd_host_bridge_enabled(vdev->vbasedev.name);
+    }
+
+    return ret;
+}
+
+static void vfio_pci_igd_lpc_bridge_realize(PCIDevice *pdev, Error **errp)
+{
+    if (pdev->devfn != PCI_DEVFN(0x1f, 0)) {
+        error_setg(errp, "VFIO dummy ISA/LPC bridge must have address 1f.0");
+        return;
+    }
+}
+
+static void vfio_pci_igd_lpc_bridge_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    dc->desc = "VFIO dummy ISA/LPC bridge for IGD assignment";
+    dc->hotpluggable = false;
+    k->realize = vfio_pci_igd_lpc_bridge_realize;
+    k->class_id = PCI_CLASS_BRIDGE_ISA;
+}
+
+static TypeInfo vfio_pci_igd_lpc_bridge_info = {
+    .name = "vfio-pci-igd-lpc-bridge",
+    .parent = TYPE_PCI_DEVICE,
+    .class_init = vfio_pci_igd_lpc_bridge_class_init,
+};
+
+static void vfio_pci_igd_register_types(void)
+{
+    type_register_static(&vfio_pci_igd_lpc_bridge_info);
+}
+
+type_init(vfio_pci_igd_register_types)
+
+int vfio_pci_igd_lpc_init(VFIOPCIDevice *vdev,
+                           struct vfio_region_info *region)
+{
+    DeviceClass *dc = DEVICE_GET_CLASS(vdev);
+    PCIDevice *lpc_bridge;
+    int ret;
+
+    if (vdev->pdev.qdev.hotplugged) {
+        return -EINVAL;
+    }
+
+    dc->hotpluggable = false;
+
+    lpc_bridge = pci_create_simple(pci_device_root_bus(&vdev->pdev),
+                                   PCI_DEVFN(0x1f, 0),
+                                   "vfio-pci-igd-lpc-bridge");
+
+    ret = vfio_pci_igd_copy(vdev, lpc_bridge, region, igd_lpc_bridge_infos,
+                            ARRAY_SIZE(igd_lpc_bridge_infos));
+    if (!ret) {
+        trace_vfio_pci_igd_lpc_bridge_enabled(vdev->vbasedev.name);
+    }
+
+    return ret;
 }

@@ -2123,6 +2123,53 @@ static int vfio_populate_device(VFIOPCIDevice *vdev)
         QLIST_INIT(&vdev->vga->region[QEMU_PCI_VGA_IO_HI].quirks);
     }
 
+    if (vbasedev->num_regions > VFIO_PCI_NUM_REGIONS) {
+        for (i = VFIO_PCI_NUM_REGIONS; i < vbasedev->num_regions; i++) {
+            struct vfio_info_cap_header *hdr;
+            struct vfio_region_info_cap_type *type;
+
+            ret = vfio_get_region_info(vbasedev, i, &reg_info);
+            if (ret) {
+                continue;
+            }
+
+            hdr = vfio_get_region_info_cap(reg_info, VFIO_REGION_INFO_CAP_TYPE);
+            if (!hdr) {
+                g_free(reg_info);
+                continue;
+            }
+
+            type = container_of(hdr, struct vfio_region_info_cap_type, header);
+            if (type->type ==
+                (VFIO_REGION_TYPE_PCI_VENDOR_TYPE | PCI_VENDOR_ID_INTEL) &&
+                type->subtype == VFIO_REGION_SUBTYPE_INTEL_IGD_OPREGION) {
+
+                ret = vfio_pci_igd_opregion_init(vdev, reg_info);
+                if (ret) {
+                    goto error;
+                }
+            } else if (type->type ==
+                (VFIO_REGION_TYPE_PCI_VENDOR_TYPE | PCI_VENDOR_ID_INTEL) &&
+                type->subtype == VFIO_REGION_SUBTYPE_INTEL_IGD_HOST_CFG) {
+
+                ret = vfio_pci_igd_host_init(vdev, reg_info);
+                if (ret) {
+                    goto error;
+                }
+            } else if (type->type ==
+                (VFIO_REGION_TYPE_PCI_VENDOR_TYPE | PCI_VENDOR_ID_INTEL) &&
+                type->subtype == VFIO_REGION_SUBTYPE_INTEL_IGD_LPC_CFG) {
+
+                ret = vfio_pci_igd_lpc_init(vdev, reg_info);
+                if (ret) {
+                    goto error;
+                }
+            }
+
+            g_free(reg_info);
+        }
+    }
+
     irq_info.index = VFIO_PCI_ERR_IRQ_INDEX;
 
     ret = ioctl(vdev->vbasedev.fd, VFIO_DEVICE_GET_IRQ_INFO, &irq_info);
@@ -2557,6 +2604,7 @@ static void vfio_instance_finalize(Object *obj)
     vfio_bars_finalize(vdev);
     g_free(vdev->emulated_config_bits);
     g_free(vdev->rom);
+    g_free(vdev->igd_opregion);
     vfio_put_device(vdev);
     vfio_put_group(group);
 }
