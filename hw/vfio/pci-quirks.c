@@ -964,6 +964,140 @@ static void vfio_probe_rtl8168_bar2_quirk(VFIOPCIDevice *vdev, int nr)
 }
 
 /*
+ * Intel IGD graphics makes use of stolen memory.  We'd really like to ignore
+ * it, guest drives don't use it, but lighting up a laptop panel seems to
+ * require support in the vBIOS and the vBIOS does use stolen memory.  Even
+ * more interesting, the vBIOS writes the host stolen memory addresses to the
+ * device, which must be stored in the ROM.  To handle this, we setup a quirk
+ * on the I/O port BAR, which is where the vBIOS performs this programming.
+ * The first two dwords of the BAR are and index and data register.  Indexes
+ * less than 0x400 select a data register for setting up this stolen memory
+ * area.  The region is minimally 1MB aligned, so we keep the offset and
+ * replace it with the address of the BDSM found on the device.  This register
+ * has hopefully been programmed by SeaBIOS with the address of a 1MB buffer
+ * in reserved memory.
+ */
+typedef struct VFIOIGDQuirk {
+    struct VFIOPCIDevice *vdev;
+    uint32_t index;
+} VFIOIGDQuirk;
+
+
+static uint64_t vfio_igd_quirk_data_read(void *opaque,
+                                         hwaddr addr, unsigned size)
+{
+    VFIOIGDQuirk *igd = opaque;
+    VFIOPCIDevice *vdev = igd->vdev;
+
+    igd->index = ~0;
+
+    return vfio_region_read(&vdev->bars[4].region, addr + 4, size);
+}
+
+static void vfio_igd_quirk_data_write(void *opaque, hwaddr addr,
+                                      uint64_t data, unsigned size)
+{
+    VFIOIGDQuirk *igd = opaque;
+    VFIOPCIDevice *vdev = igd->vdev;
+
+    if (igd->index < 0x400) {
+        uint32_t bdsm;
+
+        pread(vdev->vbasedev.fd, &bdsm, 4, vdev->config_offset + 0x5c);
+        bdsm &= ~((1 << 20) - 1);
+        if (bdsm) {
+            data &= (1 << 20) - 1;
+            data |= bdsm;
+        } else {
+            error_report("Guest wrote IGD stolen memory and we have nowhere to redirect to - update SeaBIOS?");
+        }
+    }
+
+    vfio_region_write(&vdev->bars[4].region, addr + 4, data, size);
+
+    /*
+     * Observation: On IVB system the vBIOS writes up through index 0x3f9,
+     * which correlates to offset 0xfe000 within the 1MB stolen memory range.
+     * This leaves the last index at 0xff000 unprogrammed resulting in DMAR
+     * faults to offset 0xff000 from the host BDSM address.  If we do one
+     * more step to program that last index, these go away.  Maybe this is
+     * a latent vBIOS bug that doesn't occur when nobody is frobbing the
+     * stolen memory address?  The index register starts at 0x1 and is
+     * incremented by 4, the data register starts at 0 and increments by 4k.
+     */
+    if (igd->index == 0x3f9) {
+        vfio_region_write(&vdev->bars[4].region, addr, igd->index + 4, 4);
+        vfio_region_write(&vdev->bars[4].region, addr + 4, data + 0x1000, size);
+    }
+
+    igd->index = ~0;
+}
+
+static const MemoryRegionOps vfio_igd_data_quirk = {
+    .read = vfio_igd_quirk_data_read,
+    .write = vfio_igd_quirk_data_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static uint64_t vfio_igd_quirk_index_read(void *opaque,
+                                          hwaddr addr, unsigned size)
+{
+    VFIOIGDQuirk *igd = opaque;
+    VFIOPCIDevice *vdev = igd->vdev;
+
+    igd->index = ~0;
+
+    return vfio_region_read(&vdev->bars[4].region, addr, size);
+}
+
+static void vfio_igd_quirk_index_write(void *opaque, hwaddr addr,
+                                       uint64_t data, unsigned size)
+{
+    VFIOIGDQuirk *igd = opaque;
+    VFIOPCIDevice *vdev = igd->vdev;
+
+    igd->index = data;
+
+    vfio_region_write(&vdev->bars[4].region, addr, data, size);
+}
+
+static const MemoryRegionOps vfio_igd_index_quirk = {
+    .read = vfio_igd_quirk_index_read,
+    .write = vfio_igd_quirk_index_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void vfio_probe_igd_bar4_quirk(VFIOPCIDevice *vdev, int nr)
+{
+    VFIOQuirk *quirk;
+    VFIOIGDQuirk *igd;
+
+    if (!vfio_pci_is(vdev, PCI_VENDOR_ID_INTEL, PCI_ANY_ID) ||
+        !vfio_is_vga(vdev) || nr != 4) {
+        return;
+    }
+
+    quirk = g_malloc0(sizeof(*quirk));
+    quirk->mem = g_new0(MemoryRegion, 2);
+    quirk->nr_mem = 2;
+    igd = quirk->data = g_malloc0(sizeof(*igd));
+    igd->vdev = vdev;
+    igd->index = ~0;
+
+    memory_region_init_io(&quirk->mem[0], OBJECT(vdev), &vfio_igd_index_quirk,
+                          igd, "vfio-igd-index-quirk", 4);
+    memory_region_add_subregion_overlap(vdev->bars[nr].region.mem,
+                                        0, &quirk->mem[0], 1);
+
+    memory_region_init_io(&quirk->mem[1], OBJECT(vdev), &vfio_igd_data_quirk,
+                          igd, "vfio-igd-data-quirk", 4);
+    memory_region_add_subregion_overlap(vdev->bars[nr].region.mem,
+                                        4, &quirk->mem[1], 1);
+
+    QLIST_INSERT_HEAD(&vdev->bars[nr].quirks, quirk, next);
+}
+
+/*
  * Common quirk probe entry points.
  */
 void vfio_vga_quirk_setup(VFIOPCIDevice *vdev)
@@ -1012,6 +1146,7 @@ void vfio_bar_quirk_setup(VFIOPCIDevice *vdev, int nr)
     vfio_probe_nvidia_bar5_quirk(vdev, nr);
     vfio_probe_nvidia_bar0_quirk(vdev, nr);
     vfio_probe_rtl8168_bar2_quirk(vdev, nr);
+    vfio_probe_igd_bar4_quirk(vdev, nr);
 }
 
 void vfio_bar_quirk_exit(VFIOPCIDevice *vdev, int nr)
